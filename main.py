@@ -33,11 +33,10 @@ app = FastAPI(title="AI Data Cleaner API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # session_id -> {"original": df, "cleaned": df or None}
 SESSIONS: dict[str, dict] = {}
 
