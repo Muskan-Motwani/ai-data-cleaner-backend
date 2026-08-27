@@ -124,7 +124,6 @@ async def apply_cleaning(req: ApplyRequest):
 
     session["cleaned"] = cleaned_df
 
-    before_report = profile_and_detect_issues(df)
     after_report = profile_and_detect_issues(cleaned_df)
 
     return {
@@ -133,10 +132,9 @@ async def apply_cleaning(req: ApplyRequest):
         "columns_before": len(df.columns),
         "columns_after": len(cleaned_df.columns),
         "applied_steps": applied_log,
-        "before_report": before_report,
         "after_report": after_report,
     }
-
+  
 
 @app.get("/download/{session_id}")
 async def download_cleaned(session_id: str):
