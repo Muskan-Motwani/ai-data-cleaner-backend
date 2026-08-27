@@ -17,6 +17,7 @@ Flow:
 import os
 import io
 import uuid
+from collections import OrderedDict
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -37,8 +38,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # session_id -> {"original": df, "cleaned": df or None}
-SESSIONS: dict[str, dict] = {}
+# Capped + LRU-evicted: free-tier hosting has ~512MB RAM, and every retry
+# (including the frontend's automatic re-upload-on-failure) creates a new
+# session holding a full dataframe. Without a cap, repeated retries or
+# uploads can silently accumulate multiple large datasets in memory until
+# the process is OOM-killed. Keeping only the most recent few sessions
+# keeps memory bounded regardless of how many times a user retries.
+MAX_SESSIONS = 5
+SESSIONS: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def _store_session(session_id: str, data: dict) -> None:
+    SESSIONS[session_id] = data
+    SESSIONS.move_to_end(session_id)
+    while len(SESSIONS) > MAX_SESSIONS:
+        SESSIONS.popitem(last=False)  # evict the oldest session
 
 
 class SuggestRequest(BaseModel):
@@ -84,7 +100,7 @@ async def upload_dataset(file: UploadFile = File(...)):
         raise HTTPException(400, f"Could not read file: {e}")
 
     session_id = str(uuid.uuid4())
-    SESSIONS[session_id] = {"original": df, "cleaned": None}
+    _store_session(session_id, {"original": df, "cleaned": None})
 
     report = profile_and_detect_issues(df)
 
@@ -123,6 +139,7 @@ async def apply_cleaning(req: ApplyRequest):
         raise HTTPException(400, f"Could not apply cleaning steps: {e}")
 
     session["cleaned"] = cleaned_df
+    SESSIONS.move_to_end(req.session_id)
 
     after_report = profile_and_detect_issues(cleaned_df)
 
@@ -134,7 +151,7 @@ async def apply_cleaning(req: ApplyRequest):
         "applied_steps": applied_log,
         "after_report": after_report,
     }
-  
+
 
 @app.get("/download/{session_id}")
 async def download_cleaned(session_id: str):
