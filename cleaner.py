@@ -9,8 +9,13 @@ Each step is a small dict like:
 
 Unknown/unsupported actions are skipped (logged, not crashed on) so one bad
 step from the AI doesn't take down the whole cleaning run.
+
+Memory note: this avoids unnecessary intermediate copies — important on
+free-tier hosting (512MB RAM), where repeated full-dataframe copies on a
+10k+ row dataset can exceed the limit and crash the process (OOM / exit 139).
 """
 
+import gc
 import pandas as pd
 
 
@@ -21,6 +26,8 @@ def _is_text_column(series: pd.Series) -> bool:
 
 
 def apply_cleaning_steps(df: pd.DataFrame, steps: list[dict]) -> tuple[pd.DataFrame, list[str]]:
+    # Work on the dataframe in place where possible instead of repeatedly
+    # copying it — one copy up front is enough.
     df = df.copy()
     log = []
 
@@ -31,12 +38,13 @@ def apply_cleaning_steps(df: pd.DataFrame, steps: list[dict]) -> tuple[pd.DataFr
         try:
             if action == "drop_duplicates":
                 before = len(df)
-                df = df.drop_duplicates()
+                df.drop_duplicates(inplace=True)
+                df.reset_index(drop=True, inplace=True)
                 log.append(f"Dropped {before - len(df)} duplicate rows")
 
             elif action == "drop_column":
                 if column in df.columns:
-                    df = df.drop(columns=[column])
+                    df.drop(columns=[column], inplace=True)
                     log.append(f"Dropped column '{column}'")
 
             elif action == "fill_missing":
@@ -44,19 +52,20 @@ def apply_cleaning_steps(df: pd.DataFrame, steps: list[dict]) -> tuple[pd.DataFr
                     continue
                 strategy = step.get("strategy", "mean")
                 if strategy == "mean" and pd.api.types.is_numeric_dtype(df[column]):
-                    df[column] = df[column].fillna(df[column].mean())
+                    df[column].fillna(df[column].mean(), inplace=True)
                 elif strategy == "median" and pd.api.types.is_numeric_dtype(df[column]):
-                    df[column] = df[column].fillna(df[column].median())
+                    df[column].fillna(df[column].median(), inplace=True)
                 elif strategy == "mode":
                     mode_val = df[column].mode()
                     if len(mode_val) > 0:
-                        df[column] = df[column].fillna(mode_val[0])
+                        df[column].fillna(mode_val[0], inplace=True)
                 elif strategy == "zero":
-                    df[column] = df[column].fillna(0)
+                    df[column].fillna(0, inplace=True)
                 elif strategy == "unknown":
-                    df[column] = df[column].fillna("Unknown")
+                    df[column].fillna("Unknown", inplace=True)
                 elif strategy == "drop_rows":
-                    df = df.dropna(subset=[column])
+                    df.dropna(subset=[column], inplace=True)
+                    df.reset_index(drop=True, inplace=True)
                 log.append(f"Filled missing values in '{column}' using strategy: {strategy}")
 
             elif action == "convert_dtype":
@@ -81,7 +90,8 @@ def apply_cleaning_steps(df: pd.DataFrame, steps: list[dict]) -> tuple[pd.DataFr
                 if iqr > 0:
                     lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
                     before = len(df)
-                    df = df[(df[column] >= lower) & (df[column] <= upper) | df[column].isna()]
+                    keep_mask = df[column].between(lower, upper) | df[column].isna()
+                    df = df.loc[keep_mask].reset_index(drop=True)
                     log.append(f"Removed {before - len(df)} outlier rows from '{column}'")
 
             elif action == "strip_whitespace":
@@ -101,8 +111,6 @@ def apply_cleaning_steps(df: pd.DataFrame, steps: list[dict]) -> tuple[pd.DataFr
                     log.append(f"Standardized case in '{column}' to {case}")
 
             elif action == "create_feature":
-                # Feature engineering: e.g. extract year/month from a date column,
-                # or a ratio between two numeric columns.
                 new_col = step.get("new_column_name")
                 method = step.get("method")
                 source = step.get("source_column")
@@ -121,5 +129,9 @@ def apply_cleaning_steps(df: pd.DataFrame, steps: list[dict]) -> tuple[pd.DataFr
 
         except Exception as e:
             log.append(f"Failed step '{action}' on '{column}': {e}")
+
+        # Free any temporary objects from this step before moving to the next
+        # one — matters on constrained-memory free-tier hosting.
+        gc.collect()
 
     return df, log
