@@ -1,8 +1,13 @@
 """
-Talks to Google Gemini (free tier) to turn a detected-issues report into a
-list of concrete, executable cleaning steps + feature engineering ideas.
-Uses function calling so we get reliable, schema-validated JSON — same
-pattern proven in the VizPilot dashboard-maker backend.
+Talks to Google Gemini via plain REST (using `requests`), NOT the
+`google-generativeai` SDK.
+
+Why: the SDK uses grpc under the hood. grpc's native (C-based) client can
+segfault (exit code 139) after a process is suspended and resumed — which
+is exactly what happens every time Render's free tier puts this service to
+sleep and wakes it back up. That produced random, hard-to-reproduce crashes
+that had nothing to do with dataset size or memory. Calling the plain HTTPS
+REST endpoint avoids grpc entirely, which eliminates that failure mode.
 
 Get a free API key (no card needed): https://aistudio.google.com/apikey
 Set it as the GEMINI_API_KEY environment variable.
@@ -10,11 +15,11 @@ Set it as the GEMINI_API_KEY environment variable.
 
 import os
 import json
-import google.generativeai as genai
+import requests
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-
+API_KEY = os.environ["GEMINI_API_KEY"]
 MODEL = "gemini-2.5-flash"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 
 CLEANING_TOOL = {
     "name": "generate_cleaning_plan",
@@ -107,30 +112,33 @@ Based on the detected issues, propose a concrete cleaning plan:
 
 Call the generate_cleaning_plan function with your plan."""
 
-    model = genai.GenerativeModel(
-        model_name=MODEL,
-        tools=[{"function_declarations": [CLEANING_TOOL]}],
-    )
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "tools": [{"functionDeclarations": [CLEANING_TOOL]}],
+        "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+    }
 
-    response = model.generate_content(
-        prompt,
-        tool_config={"function_calling_config": {"mode": "ANY"}},
-    )
+    try:
+        response = requests.post(
+            API_URL,
+            params={"key": API_KEY},
+            json=body,
+            timeout=60,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Gemini request failed: {e}"}
 
-    for part in response.candidates[0].content.parts:
-        if part.function_call:
-            return _to_plain(part.function_call.args)
+    data = response.json()
 
-    return {"error": "No suggestion generated"}
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        for part in parts:
+            if "functionCall" in part:
+                # REST responses already give plain JSON-safe dicts — no
+                # protobuf conversion needed here, unlike the old SDK path.
+                return part["functionCall"]["args"]
+    except (KeyError, IndexError) as e:
+        return {"error": f"Unexpected Gemini response shape: {e}", "raw": data}
 
-
-def _to_plain(obj):
-    """Recursively converts Gemini's protobuf-backed args into plain
-    Python dict/list/str/number so they're JSON-serializable."""
-    if hasattr(obj, "items"):
-        return {k: _to_plain(v) for k, v in obj.items()}
-    if isinstance(obj, (str, bytes)):
-        return obj
-    if hasattr(obj, "__iter__"):
-        return [_to_plain(v) for v in obj]
-    return obj
+    return {"error": "No suggestion generated", "raw": data}
