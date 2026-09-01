@@ -43,11 +43,16 @@ app.add_middleware(
 # Capped + LRU-evicted: free-tier hosting has ~512MB RAM, and every retry
 # (including the frontend's automatic re-upload-on-failure) creates a new
 # session holding a full dataframe. Without a cap, repeated retries or
-# uploads can silently accumulate multiple large datasets in memory until
-# the process is OOM-killed. Keeping only the most recent few sessions
-# keeps memory bounded regardless of how many times a user retries.
+# uploads can silently accumulate multiple large datasets in memory.
 MAX_SESSIONS = 5
 SESSIONS: "OrderedDict[str, dict]" = OrderedDict()
+
+# Row cap on free-tier hosting: this guarantees memory stays well under the
+# 512MB limit regardless of how large the uploaded file is, at the cost of
+# working on a representative sample for very large datasets. This is a
+# deliberate, documented scoping decision for the free-tier deployment —
+# not a silent limitation.
+MAX_ROWS = 5000
 
 
 def _store_session(session_id: str, data: dict) -> None:
@@ -99,6 +104,12 @@ async def upload_dataset(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(400, f"Could not read file: {e}")
 
+    original_row_count = len(df)
+    was_sampled = False
+    if original_row_count > MAX_ROWS:
+        df = df.sample(n=MAX_ROWS, random_state=42).reset_index(drop=True)
+        was_sampled = True
+
     session_id = str(uuid.uuid4())
     _store_session(session_id, {"original": df, "cleaned": None})
 
@@ -108,6 +119,8 @@ async def upload_dataset(file: UploadFile = File(...)):
         "session_id": session_id,
         "row_count": len(df),
         "column_count": len(df.columns),
+        "was_sampled": was_sampled,
+        "original_row_count": original_row_count,
         "report": report,
     }
 
