@@ -17,6 +17,7 @@ Flow:
 import os
 import io
 import uuid
+import multiprocessing as mp
 from collections import OrderedDict
 
 import pandas as pd
@@ -39,19 +40,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# session_id -> {"original": df, "cleaned": df or None}
-# Capped + LRU-evicted: free-tier hosting has ~512MB RAM, and every retry
-# (including the frontend's automatic re-upload-on-failure) creates a new
-# session holding a full dataframe. Without a cap, repeated retries or
-# uploads can silently accumulate multiple large datasets in memory.
 MAX_SESSIONS = 5
 SESSIONS: "OrderedDict[str, dict]" = OrderedDict()
-
-# Row cap on free-tier hosting: this guarantees memory stays well under the
-# 512MB limit regardless of how large the uploaded file is, at the cost of
-# working on a representative sample for very large datasets. This is a
-# deliberate, documented scoping decision for the free-tier deployment —
-# not a silent limitation.
 MAX_ROWS = 5000
 
 
@@ -59,7 +49,7 @@ def _store_session(session_id: str, data: dict) -> None:
     SESSIONS[session_id] = data
     SESSIONS.move_to_end(session_id)
     while len(SESSIONS) > MAX_SESSIONS:
-        SESSIONS.popitem(last=False)  # evict the oldest session
+        SESSIONS.popitem(last=False)
 
 
 class SuggestRequest(BaseModel):
@@ -68,7 +58,7 @@ class SuggestRequest(BaseModel):
 
 class ApplyRequest(BaseModel):
     session_id: str
-    steps: list[dict]  # the cleaning_steps array the user approved (from /suggest-cleaning)
+    steps: list[dict]
 
 
 @app.get("/")
@@ -138,18 +128,62 @@ async def suggest_cleaning(req: SuggestRequest):
     return suggestions
 
 
+def _run_cleaning_in_subprocess(df: pd.DataFrame, steps: list[dict], result_queue: "mp.Queue"):
+    """Runs in a separate process. If pandas/numpy hits a native crash here,
+    only this subprocess dies — the main FastAPI server keeps running."""
+    try:
+        cleaned_df, applied_log = apply_cleaning_steps(df, steps)
+        result_queue.put({"ok": True, "cleaned_df": cleaned_df, "log": applied_log})
+    except Exception as e:
+        result_queue.put({"ok": False, "error": str(e)})
+
+
 @app.post("/apply-cleaning")
 async def apply_cleaning(req: ApplyRequest):
-    """Applies the user-approved cleaning steps and returns a before/after summary."""
+    """Applies the user-approved cleaning steps and returns a before/after summary.
+
+    Runs the actual cleaning in a separate process. This is deliberate: if a
+    native pandas/numpy operation crashes (segfault) instead of raising a normal
+    Python exception, a plain try/except in this process cannot catch it — the
+    whole server process would die with it, killing every other in-flight
+    request and losing all sessions. Isolating the work in a subprocess means
+    a crash there is contained: we detect it, return a clean error to this one
+    request, and the main API server keeps running normally for everyone else.
+    """
     session = SESSIONS.get(req.session_id)
     if session is None:
         raise HTTPException(404, "Session not found. Please upload the dataset again.")
 
     df = session["original"]
-    try:
-        cleaned_df, applied_log = apply_cleaning_steps(df, req.steps)
-    except Exception as e:
-        raise HTTPException(400, f"Could not apply cleaning steps: {e}")
+
+    ctx = mp.get_context("fork")
+    result_queue = ctx.Queue()
+    process = ctx.Process(target=_run_cleaning_in_subprocess, args=(df, req.steps, result_queue))
+    process.start()
+    process.join(timeout=45)
+
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        raise HTTPException(504, "Cleaning took too long and was stopped. Try with fewer steps or a smaller dataset.")
+
+    if process.exitcode != 0:
+        raise HTTPException(
+            500,
+            f"The cleaning process crashed unexpectedly (exit code {process.exitcode}). "
+            "This usually means one of the selected steps hit an unstable operation on this data. "
+            "Try unchecking a few steps (especially 'remove outliers') and applying again.",
+        )
+
+    if result_queue.empty():
+        raise HTTPException(500, "Cleaning process ended with no result. Please try again.")
+
+    result = result_queue.get()
+    if not result["ok"]:
+        raise HTTPException(400, f"Could not apply cleaning steps: {result['error']}")
+
+    cleaned_df = result["cleaned_df"]
+    applied_log = result["log"]
 
     session["cleaned"] = cleaned_df
     SESSIONS.move_to_end(req.session_id)
